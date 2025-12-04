@@ -1,97 +1,148 @@
+#!/usr/bin/env python3
 import numpy as np
 from scipy.io import wavfile
 from scipy.signal import find_peaks
 import math
+import os
+import sys
+import glob
+import re   # <-- this was missing before!
+
+# =============== CONFIG ===============
+OUTPUT_FOLDER = "guitar_di_samples"
+# ======================================
+
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 def freq_to_note(freq):
     if freq <= 0:
-        return "Unknown"
-    midi_note = 12 * math.log2(freq / 440) + 69
+        return "Unknown", -1
+    midi_note = 12 * math.log2(freq / 440.0) + 69
     note_num = int(round(midi_note))
-    notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    note_name = notes[note_num % 12]
-    octave = (note_num // 12) - 1  # Standard octave numbering
-    return f"{note_name}{octave}"
+    notes_sharp = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    note_name = notes_sharp[note_num % 12]
+    octave = (note_num // 12) - 1
+    return f"{note_name}{octave}", note_num
 
-def estimate_pitch(segment, fs, low_freq=27.5, high_freq=4186):  # A0 to C8 for guitar range
-    # Autocorrelation
-    corr = np.correlate(segment, segment, mode='full')
-    corr = corr[len(corr)//2:]  # Second half
-    corr = corr / np.max(corr)  # Normalize
-    
-    # Find first peak after zero-lag (ignore zero)
-    d = np.diff(corr)
-    start = np.where(d > 0)[0][0]  # Start searching after zero
-    peak = np.argmax(corr[start:]) + start
-    if peak == 0:
+def estimate_pitch(segment, fs):
+    if len(segment) < 1024:
         return 0
-    
-    # Frequency = fs / lag
+    corr = np.correlate(segment, segment, mode='full')
+    corr = corr[len(corr)//2:]
+    if np.max(corr) == 0:
+        return 0
+    corr /= np.max(corr)
+    d = np.diff(corr)
+    try:
+        start = np.where(d > 0)[0][0]
+    except IndexError:
+        return 0
+    peak = np.argmax(corr[start:]) + start
+    if peak <= 1:
+        return 0
     freq = fs / peak
-    
-    # Clip to guitar range (E2 ~82Hz to E6 ~1318Hz, but wider for safety)
-    if freq < low_freq or freq > high_freq:
+    if freq < 60 or freq > 1600:
         return 0
     return freq
 
-# Load the WAV file
-fs, audio = wavfile.read('input_guitar.wav')
+def detect_articulation(filename):
+    name = os.path.basename(filename).lower()
+    if re.search(r'\bupstroke\b|\bup\b', name):
+        return "upstroke"
+    elif re.search(r'\bdownstroke\b|\bdown\b', name) and 'palm' not in name:
+        return "downstroke"
+    elif re.search(r'palm.*mute.*up|palm.*up|pm.*up|pm_up', name):
+        return "palm_mute_up"
+    elif re.search(r'palm|pm', name):
+        return "palm_mute_down"
+    return "downstroke"
 
-# Convert to mono if stereo
-if len(audio.shape) > 1:
-    audio = np.mean(audio, axis=1)
+def process_file(filepath):
+    print(f"\nProcessing: {os.path.basename(filepath)}")
+    articulation = detect_articulation(filepath)
+    print(f"   Articulation → {articulation}")
 
-# Normalize to float32 for processing (-1 to 1 range)
-audio = audio.astype(np.float32) / np.max(np.abs(audio))
+    fs, audio = wavfile.read(filepath)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    audio = audio.astype(np.float32)
+    audio /= (np.max(np.abs(audio)) + 1e-8)
 
-# Compute RMS envelope (window size ~20-50 ms for guitar notes)
-window_size = int(0.02 * fs)  # 20 ms window
-rms = np.sqrt(np.convolve(audio**2, np.ones(window_size)/window_size, mode='valid'))
+    window_size = int(0.03 * fs)
+    rms = np.sqrt(np.convolve(audio**2, np.ones(window_size)/window_size, mode='valid'))
+    rms_norm = rms / (np.max(rms) + 1e-8)
 
-# Normalize RMS and set threshold (adjust based on your audio; e.g., 0.1-0.3 for quiet DI)
-rms_norm = rms / np.max(rms)
-threshold = 0.2  # Tune this: lower for quieter notes, higher to avoid noise
+    peaks, _ = find_peaks(rms_norm, height=0.15, distance=int(0.4 * fs), prominence=0.08)
+    onsets = peaks + (window_size // 2)
+    onsets = np.append(onsets, len(audio))
 
-# Find peaks in RMS where energy rises above threshold (prominence helps filter)
-peaks, _ = find_peaks(rms_norm, height=threshold, distance=int(0.5 * fs), prominence=0.1)  # Min 0.5s between notes
+    print(f"   Found {len(onsets)-1} notes\n")
 
-# Onset samples: add half window to align (since convolve shifts)
-onsets = peaks + (window_size // 2)
+    for i in range(len(onsets)-1):
+        start, end = onsets[i], onsets[i+1]
+        segment = audio[start:end]
 
-# Add the end of the audio as the last "offset"
-onsets = np.append(onsets, len(audio))
+        nonzero = np.where(np.abs(segment) > 0.015)[0]
+        if len(nonzero) == 0:
+            continue
+        segment = segment[nonzero[0]:nonzero[-1]+1]
 
-# Segment the audio into individual notes
-notes_segments = []
-for i in range(len(onsets) - 1):
-    start = onsets[i]
-    end = onsets[i + 1]
-    
-    # Optional: Trim trailing silence in segment (find last sample above threshold)
-    segment = audio[start:end]
-    trim_idx = np.where(np.abs(segment) > 0.01)[0]  # Threshold for silence
-    if len(trim_idx) > 0:
-        end = start + trim_idx[-1] + 1
-    segment = audio[start:end]
-    
-    notes_segments.append(segment)
+        mid_len = int(len(segment) * 0.6)
+        mid_start = (len(segment) - mid_len) // 2
+        mid_segment = segment[mid_start:mid_start + mid_len]
 
-# Identify notes and save
-note_names = []
-for i, segment in enumerate(notes_segments):
-    # Take a stable part of the note (e.g., middle 50% to avoid attack/decay)
-    mid_start = int(len(segment) * 0.25)
-    mid_end = int(len(segment) * 0.75)
-    mid_segment = segment[mid_start:mid_end]
-    
-    freq = estimate_pitch(mid_segment, fs)
-    note = freq_to_note(freq)
-    note_names.append(note)
-    
-    if note == "Unknown":
-        note = f"unknown_{i}"
-    output_file = f"note_{note}.wav"
-    # Scale back to int16 (common WAV format)
-    segment_int = (segment * 32767).astype(np.int16)
-    wavfile.write(output_file, fs, segment_int)
-    print(f"Saved: {output_file}")
+        freq = estimate_pitch(mid_segment, fs)
+        note_name, midi_num = freq_to_note(freq)
+
+        midi_str = "000" if midi_num == -1 else f"{midi_num:03d}"
+        note_display = f"unknown_{i:02d}" if midi_num == -1 else note_name
+
+        filename = f"{note_display}_{midi_str}_{articulation}.wav"
+        out_path = os.path.join(OUTPUT_FOLDER, filename)
+        wavfile.write(out_path, fs, np.int16(segment * 32767))
+        print(f"   → {filename}  ({freq:.1f} Hz)")
+
+    print(f"\nDone! → {OUTPUT_FOLDER}/\n")
+
+# =============== MAIN ===============
+if __name__ == "__main__":
+    wav_files = sorted([f for f in glob.glob("*.wav") if not f.startswith("._")])
+
+    if not wav_files:
+        print("No .wav files found!")
+        sys.exit(1)
+
+    print("Found WAV files:")
+    for i, f in enumerate(wav_files, 1):
+        print(f"  [{i}] {f}")
+
+    # Allow command-line flag -a / --all
+    if len(sys.argv) > 1 and sys.argv[1] in ["-a", "--all"]:
+        for f in wav_files:
+            process_file(f)
+        print("ALL FILES PROCESSED!")
+        sys.exit(0)
+
+    print("\nEnter number(s) or 'all' (e.g. 1  or  1 3 5  or  all):")
+    choice = input("> ").strip().lower()
+
+    if choice == "all":
+        for f in wav_files:
+            process_file(f)
+    else:
+        # Accept anything that has digits in it
+        indices = []
+        for part in choice.replace(",", " ").split():
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(wav_files):
+                    indices.append(idx)
+                else:
+                    print(f"Invalid number: {part}")
+        if not indices:
+            print("No valid selection. Bye!")
+            sys.exit(1)
+        for idx in indices:
+            process_file(wav_files[idx])
+
+    print(f"\nFinished! All samples are in → {OUTPUT_FOLDER}/")
