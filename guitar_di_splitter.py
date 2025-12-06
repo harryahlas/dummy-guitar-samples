@@ -6,7 +6,7 @@ import math
 import os
 import sys
 import glob
-import re   # <-- this was missing before!
+import re
 
 # =============== CONFIG ===============
 OUTPUT_FOLDER = "guitar_di_samples"
@@ -21,7 +21,7 @@ def freq_to_note(freq):
     note_num = int(round(midi_note))
     notes_sharp = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     note_name = notes_sharp[note_num % 12]
-    octave = (note_num // 12) - 1
+    octave = (note_num // 12) - 2  # ✅ FIXED: Changed from -1 to -2
     return f"{note_name}{octave}", note_num
 
 def estimate_pitch(segment, fs):
