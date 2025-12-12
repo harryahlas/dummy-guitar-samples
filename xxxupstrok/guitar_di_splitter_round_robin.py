@@ -47,9 +47,7 @@ def estimate_pitch(segment, fs):
 
 def detect_articulation(filename):
     name = os.path.basename(filename).lower()
-    #if re.search(r'\bupstroke\b|\bup\b', name):
-    #    return "upstroke"
-    if "upstroke" in name or " up " in f" {name} ":   # forces word-like matching
+    if re.search(r'\bupstroke\b|\bup\b', name):
         return "upstroke"
     elif re.search(r'\bdownstroke\b|\bdown\b', name) and 'palm' not in name:
         return "downstroke"
