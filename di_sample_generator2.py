@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-
-# python di_sample_generator2.py di_samples_for_generator.wav sample_generator_output --versions 1
-
 """
 Guitar Sample Library Generator
 Processes guitar DI recordings and generates complete sample libraries for VST instruments.
