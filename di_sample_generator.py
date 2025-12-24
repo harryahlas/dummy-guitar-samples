@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Unified Guitar DI Sample Generator
+Unified Guitar DI Sample Generator v2
 Processes guitar DI recordings, splits notes, generates round-robin variants,
 and synthesizes missing notes for complete sample libraries.
+
+v2 improvements:
+- Harmonic-aware pitch shifting that preserves guitar timbre
+- Inharmonicity modeling based on string physics
+- Attack/sustain separation for more natural transposition
+- Formant preservation to maintain guitar body character
+- Multi-source weighted synthesis for missing notes
 """
 
 import numpy as np
 import librosa
 import soundfile as sf
 from scipy.io import wavfile
-from scipy.signal import find_peaks, stft, istft
+from scipy.signal import find_peaks, stft, istft, butter, sosfilt, resample_poly
+from scipy.interpolate import interp1d
 from tqdm import tqdm
 import argparse
 import os
@@ -29,6 +37,20 @@ GUITAR_RANGE = {
 
 NOTE_NAMES_SHARP = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
+# Guitar string physical properties (approximate for standard steel strings)
+# Inharmonicity coefficient B varies by string - higher for thicker wound strings
+STRING_INHARMONICITY = {
+    # MIDI ranges for each string (approximate for 7-string Eb standard)
+    (22, 27): 0.0003,   # 7th string (A#0) - thick wound, high inharmonicity
+    (27, 32): 0.00025,  # 6th string (D#1)
+    (32, 37): 0.0002,   # 5th string (G#1)
+    (37, 42): 0.00015,  # 4th string (C#2)
+    (42, 47): 0.0001,   # 3rd string (F#2) - wound/plain transition
+    (47, 52): 0.00005,  # 2nd string (A#2) - plain steel
+    (52, 88): 0.00003,  # 1st string (D#3+) - plain steel, low inharmonicity
+}
+
+
 # =============== UTILITY FUNCTIONS ===============
 
 def midi_to_note_name(midi_num: int) -> str:
@@ -38,12 +60,25 @@ def midi_to_note_name(midi_num: int) -> str:
     return f"{note_name}{octave}"
 
 
+def midi_to_freq(midi_num: int) -> float:
+    """Convert MIDI note number to frequency in Hz."""
+    return 440.0 * (2.0 ** ((midi_num - 69) / 12.0))
+
+
 def freq_to_midi(freq: float) -> int:
     """Convert frequency in Hz to MIDI note number."""
     if freq <= 0:
         return -1
     midi_note = 12 * math.log2(freq / 440.0) + 69
     return int(round(midi_note))
+
+
+def get_inharmonicity_coeff(midi_num: int) -> float:
+    """Get the inharmonicity coefficient for a given MIDI note."""
+    for (low, high), coeff in STRING_INHARMONICITY.items():
+        if low <= midi_num < high:
+            return coeff
+    return 0.0001  # default
 
 
 def detect_articulation(filename: str) -> str:
@@ -182,6 +217,376 @@ def extract_and_identify_notes(audio: np.ndarray, fs: int) -> Dict[int, np.ndarr
     return detected_notes
 
 
+# =============== IMPROVED SYNTHESIS FUNCTIONS ===============
+
+def separate_attack_sustain(audio: np.ndarray, fs: int, attack_ms: float = 50) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Separate the attack transient from the sustain portion of a note.
+    Returns (attack, sustain, crossover_sample).
+    """
+    attack_samples = int(attack_ms / 1000.0 * fs)
+    attack_samples = min(attack_samples, len(audio) // 4)  # Don't take more than 25%
+    
+    # Find the peak in the attack region
+    attack_region = audio[:attack_samples * 2]
+    peak_idx = np.argmax(np.abs(attack_region))
+    
+    # Set crossover point just after the peak
+    crossover = min(peak_idx + int(10 / 1000.0 * fs), len(audio) - 1)
+    
+    attack = audio[:crossover].copy()
+    sustain = audio[crossover:].copy()
+    
+    return attack, sustain, crossover
+
+
+def extract_harmonic_envelope(audio: np.ndarray, fs: int, f0: float, n_harmonics: int = 20) -> Dict:
+    """
+    Extract the amplitude and phase envelope of each harmonic.
+    This captures the "fingerprint" of the guitar's timbre.
+    """
+    n_fft = 4096
+    hop = n_fft // 4
+    
+    # STFT
+    D = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+    freqs = librosa.fft_frequencies(sr=fs, n_fft=n_fft)
+    
+    harmonics = {}
+    
+    for h in range(1, n_harmonics + 1):
+        harmonic_freq = f0 * h
+        
+        # Find the closest frequency bin
+        bin_idx = np.argmin(np.abs(freqs - harmonic_freq))
+        
+        # Get amplitude and phase over time for this harmonic
+        # Use a small window around the bin to capture any slight detuning
+        window = 2
+        start_bin = max(0, bin_idx - window)
+        end_bin = min(len(freqs), bin_idx + window + 1)
+        
+        # Sum energy in window
+        harmonic_band = D[start_bin:end_bin, :]
+        amplitude = np.sum(np.abs(harmonic_band), axis=0)
+        
+        # Weighted phase (by magnitude)
+        mags = np.abs(harmonic_band)
+        phases = np.angle(harmonic_band)
+        weighted_phase = np.sum(phases * mags, axis=0) / (np.sum(mags, axis=0) + 1e-10)
+        
+        harmonics[h] = {
+            'amplitude': amplitude,
+            'phase': weighted_phase,
+            'freq': harmonic_freq,
+            'bin': bin_idx
+        }
+    
+    return harmonics
+
+
+def apply_inharmonicity_shift(audio: np.ndarray, fs: int, 
+                               source_midi: int, target_midi: int,
+                               source_f0: float, target_f0: float) -> np.ndarray:
+    """
+    Shift audio while modeling string inharmonicity.
+    Real guitar strings have stretched partials: f_n = n * f0 * sqrt(1 + B * n^2)
+    This creates the characteristic "brightness" of higher notes.
+    """
+    n_fft = 4096
+    hop = n_fft // 4
+    
+    # Get inharmonicity coefficients
+    B_source = get_inharmonicity_coeff(source_midi)
+    B_target = get_inharmonicity_coeff(target_midi)
+    
+    # STFT
+    D = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+    freqs = librosa.fft_frequencies(sr=fs, n_fft=n_fft)
+    
+    # Create output spectrum
+    D_out = np.zeros_like(D)
+    
+    # Process each harmonic
+    n_harmonics = int(min(fs / 2 / source_f0, 30))  # Up to Nyquist or 30 harmonics
+    
+    for h in range(1, n_harmonics + 1):
+        # Source frequency with inharmonicity
+        source_harmonic = h * source_f0 * np.sqrt(1 + B_source * h * h)
+        # Target frequency with different inharmonicity
+        target_harmonic = h * target_f0 * np.sqrt(1 + B_target * h * h)
+        
+        if target_harmonic >= fs / 2:
+            continue
+            
+        # Find source bin
+        source_bin = int(round(source_harmonic * n_fft / fs))
+        target_bin = int(round(target_harmonic * n_fft / fs))
+        
+        if source_bin >= len(freqs) or target_bin >= len(freqs):
+            continue
+        
+        # Window around source bin
+        window = 3
+        src_start = max(0, source_bin - window)
+        src_end = min(len(freqs), source_bin + window + 1)
+        
+        tgt_start = max(0, target_bin - window)
+        tgt_end = min(len(freqs), target_bin + window + 1)
+        
+        # Map source bins to target bins
+        src_width = src_end - src_start
+        tgt_width = tgt_end - tgt_start
+        
+        if src_width > 0 and tgt_width > 0:
+            # Resample if widths differ
+            source_content = D[src_start:src_end, :]
+            
+            if src_width != tgt_width:
+                # Interpolate to match target width
+                x_src = np.linspace(0, 1, src_width)
+                x_tgt = np.linspace(0, 1, tgt_width)
+                
+                real_interp = interp1d(x_src, np.real(source_content), axis=0, 
+                                       kind='linear', fill_value='extrapolate')
+                imag_interp = interp1d(x_src, np.imag(source_content), axis=0,
+                                       kind='linear', fill_value='extrapolate')
+                
+                target_content = real_interp(x_tgt) + 1j * imag_interp(x_tgt)
+            else:
+                target_content = source_content
+            
+            # Apply amplitude scaling based on harmonic number
+            # Higher harmonics lose more energy when pitch shifting up
+            if target_midi > source_midi:
+                harmonic_decay = 0.98 ** (h * (target_midi - source_midi) / 12.0)
+            else:
+                harmonic_decay = 1.02 ** (h * (source_midi - target_midi) / 24.0)
+            harmonic_decay = np.clip(harmonic_decay, 0.3, 1.5)
+            
+            D_out[tgt_start:tgt_end, :] += target_content * harmonic_decay
+    
+    # Inverse STFT
+    audio_out = librosa.istft(D_out, hop_length=hop, length=len(audio))
+    
+    return audio_out
+
+
+def formant_preserve_shift(audio: np.ndarray, fs: int, semitones: float) -> np.ndarray:
+    """
+    Pitch shift while preserving formants (spectral envelope).
+    This keeps the "guitar body" resonance character consistent.
+    """
+    # Get spectral envelope using LPC
+    n_fft = 2048
+    hop = n_fft // 4
+    
+    # Compute original spectral envelope
+    D_orig = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+    mag_orig = np.abs(D_orig)
+    
+    # Smooth to get envelope (formants)
+    # Use a wide smoothing window
+    from scipy.ndimage import uniform_filter1d
+    envelope = uniform_filter1d(mag_orig, size=50, axis=0)
+    envelope = np.maximum(envelope, 1e-10)
+    
+    # Pitch shift the audio
+    shifted = librosa.effects.pitch_shift(audio, sr=fs, n_steps=semitones)
+    
+    # Get the shifted spectrum
+    D_shifted = librosa.stft(shifted, n_fft=n_fft, hop_length=hop)
+    mag_shifted = np.abs(D_shifted)
+    phase_shifted = np.angle(D_shifted)
+    
+    # Get shifted envelope
+    envelope_shifted = uniform_filter1d(mag_shifted, size=50, axis=0)
+    envelope_shifted = np.maximum(envelope_shifted, 1e-10)
+    
+    # Apply original envelope to shifted content
+    # This preserves the "body" of the guitar
+    mag_corrected = mag_shifted * (envelope / envelope_shifted)
+    
+    # Reconstruct
+    D_corrected = mag_corrected * np.exp(1j * phase_shifted)
+    audio_out = librosa.istft(D_corrected, hop_length=hop, length=len(audio))
+    
+    return audio_out
+
+
+def resynthesize_with_new_pitch(audio: np.ndarray, fs: int,
+                                 source_midi: int, target_midi: int) -> np.ndarray:
+    """
+    High-quality pitch shifting using harmonic analysis/resynthesis.
+    Separates attack from sustain and processes them differently.
+    """
+    source_f0 = midi_to_freq(source_midi)
+    target_f0 = midi_to_freq(target_midi)
+    semitones = target_midi - source_midi
+    
+    # Separate attack and sustain
+    attack, sustain, crossover = separate_attack_sustain(audio, fs)
+    
+    # Process attack with formant preservation (keeps the "pick" sound natural)
+    # Attack is short and transient-heavy, so we use simpler shifting
+    if len(attack) > 100:
+        attack_shifted = formant_preserve_shift(attack, fs, semitones)
+    else:
+        attack_shifted = attack
+    
+    # Process sustain with inharmonicity-aware shifting
+    if len(sustain) > 1024:
+        sustain_shifted = apply_inharmonicity_shift(
+            sustain, fs, source_midi, target_midi, source_f0, target_f0
+        )
+        
+        # Also apply subtle formant correction
+        sustain_shifted = formant_preserve_shift(sustain_shifted, fs, 0)  # Just envelope, no shift
+    else:
+        sustain_shifted = sustain
+    
+    # Crossfade attack and sustain back together
+    crossfade_samples = min(int(0.005 * fs), len(attack_shifted) // 2, len(sustain_shifted) // 2)
+    
+    if crossfade_samples > 0 and len(attack_shifted) > crossfade_samples:
+        fade_out = np.linspace(1, 0, crossfade_samples)
+        fade_in = np.linspace(0, 1, crossfade_samples)
+        
+        attack_shifted[-crossfade_samples:] *= fade_out
+        sustain_shifted[:crossfade_samples] *= fade_in
+    
+    # Concatenate
+    result = np.concatenate([attack_shifted, sustain_shifted])
+    
+    return result
+
+
+def synthesize_note_advanced(
+    target_midi: int,
+    detected_notes: Dict[int, np.ndarray],
+    fs: int
+) -> Optional[np.ndarray]:
+    """
+    Synthesize a missing note using advanced multi-source weighted blending.
+    
+    Key improvements over simple interpolation:
+    1. Uses multiple source notes weighted by distance
+    2. Applies inharmonicity modeling
+    3. Preserves attack characteristics
+    4. Maintains formant structure
+    """
+    if not detected_notes:
+        return None
+    
+    available_midis = sorted(detected_notes.keys())
+    
+    # Find the closest notes (up to 4 sources for blending)
+    distances = [(abs(midi - target_midi), midi) for midi in available_midis]
+    distances.sort()
+    
+    # Get up to 4 closest notes
+    sources = []
+    for dist, midi in distances[:4]:
+        if dist <= 12:  # Only use sources within an octave
+            sources.append((dist, midi))
+    
+    if not sources:
+        # Fallback: use the single closest note
+        closest_midi = distances[0][1]
+        semitones = target_midi - closest_midi
+        return librosa.effects.pitch_shift(
+            detected_notes[closest_midi], sr=fs, n_steps=semitones
+        )
+    
+    # If we have the exact note, return it
+    if sources[0][0] == 0:
+        return detected_notes[sources[0][1]].copy()
+    
+    # Calculate weights (inverse distance, with preference for closer notes)
+    weights = []
+    shifted_audios = []
+    target_len = None
+    
+    for dist, midi in sources:
+        # Weight falls off with distance squared
+        weight = 1.0 / (1.0 + dist * dist)
+        weights.append(weight)
+        
+        # Shift this source to target pitch
+        shifted = resynthesize_with_new_pitch(
+            detected_notes[midi], fs, midi, target_midi
+        )
+        shifted_audios.append(shifted)
+        
+        if target_len is None:
+            target_len = len(shifted)
+    
+    # Normalize weights
+    weights = np.array(weights)
+    weights /= np.sum(weights)
+    
+    # Blend the shifted sources
+    # Match all lengths to the longest
+    max_len = max(len(a) for a in shifted_audios)
+    result = np.zeros(max_len)
+    
+    for i, audio in enumerate(shifted_audios):
+        # Pad shorter audios
+        if len(audio) < max_len:
+            audio = np.pad(audio, (0, max_len - len(audio)))
+        
+        result += audio * weights[i]
+    
+    # Apply subtle random variation to prevent exact repetition artifacts
+    # This adds micro-timing and amplitude variation per harmonic band
+    result = add_micro_variation(result, fs)
+    
+    return result
+
+
+def add_micro_variation(audio: np.ndarray, fs: int) -> np.ndarray:
+    """
+    Add subtle per-band timing and amplitude variations.
+    This prevents the "too perfect" sound of pure synthesis.
+    """
+    n_fft = 2048
+    hop = n_fft // 4
+    
+    D = librosa.stft(audio, n_fft=n_fft, hop_length=hop)
+    freqs = librosa.fft_frequencies(sr=fs, n_fft=n_fft)
+    
+    # Define frequency bands
+    band_edges = [0, 100, 200, 400, 800, 1600, 3200, 6400, fs/2]
+    
+    for i in range(len(band_edges) - 1):
+        low_bin = np.searchsorted(freqs, band_edges[i])
+        high_bin = np.searchsorted(freqs, band_edges[i + 1])
+        
+        if high_bin <= low_bin:
+            continue
+        
+        # Random amplitude variation (±0.5 dB)
+        amp_var = 10 ** (np.random.uniform(-0.025, 0.025))
+        
+        # Random phase shift (simulates micro-timing differences)
+        # Smaller shifts for higher frequencies
+        max_shift_ms = 2.0 / (i + 1)  # 2ms for lowest band, decreasing
+        phase_shift = np.random.uniform(-max_shift_ms, max_shift_ms) / 1000.0
+        
+        # Apply to this band
+        D[low_bin:high_bin, :] *= amp_var
+        
+        # Phase shift
+        time_shift_samples = phase_shift * fs
+        phase_ramp = np.exp(-2j * np.pi * freqs[low_bin:high_bin, np.newaxis] * phase_shift)
+        D[low_bin:high_bin, :] *= phase_ramp
+    
+    # Reconstruct
+    result = librosa.istft(D, hop_length=hop, length=len(audio))
+    
+    return result
+
+
 def humanize_guitar_note(audio: np.ndarray, sample_rate: int, orig_len: int) -> np.ndarray:
     """
     Add humanization using frequency-band phase delays (STFT-based).
@@ -236,65 +641,6 @@ def humanize_guitar_note(audio: np.ndarray, sample_rate: int, orig_len: int) -> 
     return noisy_audio
 
 
-def pitch_shift_audio(audio: np.ndarray, semitones: float, fs: int) -> np.ndarray:
-    """Pitch shift audio by given number of semitones using librosa."""
-    return librosa.effects.pitch_shift(audio, sr=fs, n_steps=semitones)
-
-
-def synthesize_note_interpolation(
-    target_midi: int, 
-    detected_notes: Dict[int, np.ndarray],
-    fs: int
-) -> Optional[np.ndarray]:
-    """
-    Synthesize a note by intelligently interpolating/pitch-shifting from detected notes.
-    Uses blending when target is equidistant between two samples, otherwise shifts nearest.
-    """
-    if not detected_notes:
-        return None
-    
-    available_midis = sorted(detected_notes.keys())
-    
-    # Find closest notes
-    distances = [(abs(midi - target_midi), midi) for midi in available_midis]
-    distances.sort()
-    
-    closest_midi = distances[0][1]
-    closest_distance = distances[0][0]
-    
-    # If we have two notes and target is roughly equidistant, blend them
-    if len(distances) > 1:
-        second_closest_midi = distances[1][1]
-        second_distance = distances[1][0]
-        
-        # Equidistant threshold: within 1 semitone of each other in distance
-        if abs(closest_distance - second_distance) <= 1:
-            # Blend the two shifted versions
-            lower_midi = min(closest_midi, second_closest_midi)
-            upper_midi = max(closest_midi, second_closest_midi)
-            
-            shift1 = target_midi - lower_midi
-            shift2 = target_midi - upper_midi
-            
-            audio1 = pitch_shift_audio(detected_notes[lower_midi], shift1, fs)
-            audio2 = pitch_shift_audio(detected_notes[upper_midi], shift2, fs)
-            
-            # Match lengths
-            min_len = min(len(audio1), len(audio2))
-            audio1 = audio1[:min_len]
-            audio2 = audio2[:min_len]
-            
-            # Blend with crossfade
-            blend_ratio = (target_midi - lower_midi) / (upper_midi - lower_midi)
-            blended = audio1 * (1 - blend_ratio) + audio2 * blend_ratio
-            
-            return blended
-    
-    # Otherwise, just pitch shift from closest
-    semitones = target_midi - closest_midi
-    return pitch_shift_audio(detected_notes[closest_midi], semitones, fs)
-
-
 def normalize_duration(audio: np.ndarray, target_duration: float, fs: int) -> np.ndarray:
     """
     Normalize audio to target duration.
@@ -323,13 +669,14 @@ def generate_sample_library(
     output_dir: str,
     num_round_robin: int = 3,
     sample_rate: Optional[int] = None,
-    duration: float = 3.0
+    duration: float = 3.0,
+    use_advanced_synthesis: bool = True
 ):
     """
     Main function to generate complete sample library.
     """
     print(f"\n{'='*70}")
-    print(f"Unified Guitar DI Sample Generator")
+    print(f"Guitar DI Sample Generator v2 (Advanced Synthesis)")
     print(f"{'='*70}")
     
     # Detect articulation from filename
@@ -350,6 +697,7 @@ def generate_sample_library(
         sys.exit(1)
     
     print(f"\n{len(detected_notes)} detected note(s) will be used for synthesis")
+    print(f"Using {'ADVANCED' if use_advanced_synthesis else 'SIMPLE'} synthesis mode")
     
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -374,7 +722,16 @@ def generate_sample_library(
                 base_audio = detected_notes[midi_num]
                 is_detected = True
             else:
-                base_audio = synthesize_note_interpolation(midi_num, detected_notes, fs)
+                if use_advanced_synthesis:
+                    base_audio = synthesize_note_advanced(midi_num, detected_notes, fs)
+                else:
+                    # Fallback to simple pitch shifting
+                    available = sorted(detected_notes.keys())
+                    closest = min(available, key=lambda x: abs(x - midi_num))
+                    semitones = midi_num - closest
+                    base_audio = librosa.effects.pitch_shift(
+                        detected_notes[closest], sr=fs, n_steps=semitones
+                    )
                 synthesized_count += 1
                 is_detected = False
             
@@ -394,26 +751,13 @@ def generate_sample_library(
                     final_audio = base_audio
                 else:
                     # Subsequent versions: add humanization
-                    if is_detected:
-                        # Use STFT-based humanization for detected notes
-                        final_audio = humanize_guitar_note(base_audio, fs, orig_len)
-                    else:
-                        # For synthesized notes, use simpler pitch/timing variation
-                        final_audio = base_audio.copy()
-                        # Small pitch variation
-                        cent_shift = np.random.uniform(-1.5, 1.5)
-                        final_audio = librosa.effects.pitch_shift(final_audio, sr=fs, n_steps=cent_shift/100.0)
-                        # Amplitude variation
-                        db_shift = np.random.uniform(-0.3, 0.3)
-                        amplitude_factor = 10 ** (db_shift / 20.0)
-                        final_audio = final_audio * amplitude_factor
+                    final_audio = humanize_guitar_note(base_audio, fs, orig_len)
                 
                 # Normalize amplitude
                 if np.max(np.abs(final_audio)) > 0:
                     final_audio = final_audio / np.max(np.abs(final_audio)) * 0.95
                 
                 # Generate filename
-                # First sample has no suffix, subsequent ones get _00, _01, etc.
                 if rr_num == 0:
                     filename = f"{note_name}_{midi_num:03d}_{articulation}.wav"
                 else:
@@ -441,7 +785,7 @@ def generate_sample_library(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate complete guitar sample library from DI recordings",
+        description="Generate complete guitar sample library from DI recordings (v2 - Advanced Synthesis)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -453,6 +797,9 @@ Examples:
   
   # Custom sample rate and duration
   %(prog)s upstroke.wav samples/ --sample-rate 48000 --duration 4.0
+  
+  # Use simple synthesis (faster, but lower quality)
+  %(prog)s input.wav output/ --simple
         """
     )
     
@@ -465,6 +812,8 @@ Examples:
                         help='Target sample rate in Hz (default: keep original)')
     parser.add_argument('--duration', type=float, default=3.0,
                         help='Target duration in seconds (default: 3.0)')
+    parser.add_argument('--simple', action='store_true',
+                        help='Use simple synthesis (faster but lower quality)')
     
     args = parser.parse_args()
     
@@ -483,7 +832,8 @@ Examples:
         output_dir=args.output_dir,
         num_round_robin=args.round_robin,
         sample_rate=args.sample_rate,
-        duration=args.duration
+        duration=args.duration,
+        use_advanced_synthesis=not args.simple
     )
 
 
