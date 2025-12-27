@@ -83,10 +83,8 @@ def estimate_pitch(audio: np.ndarray, fs: int) -> float:
     if len(audio) < 1024:
         return 0
     
-    # Use middle 60% of audio for stability
-    mid_len = int(len(audio) * 0.6)
-    mid_start = (len(audio) - mid_len) // 2
-    segment = audio[mid_start:mid_start + mid_len]
+    # Use full audio for better low frequency detection
+    segment = audio.copy()
     
     # Normalize
     segment = segment - np.mean(segment)
@@ -116,18 +114,41 @@ def estimate_pitch(audio: np.ndarray, fs: int) -> float:
     freq = fs / peak
     
     # Filter out unreasonable frequencies for guitar
-    if freq < 60 or freq > 1600:
+    # Lower limit extended to catch flat low bass notes (A#1 is ~29 Hz)
+    if freq < 20 or freq > 1600:
         return 0
     
     return freq
 
-
-def trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
-    """Trim silence from beginning and end of audio."""
+def trim_silence(audio: np.ndarray, threshold: float = 0.01, fs: int = 44100) -> np.ndarray:
+    """
+    Trim silence from beginning and end of audio.
+    Applies short fades to avoid clicks/pops.
+    """
     nonzero = np.where(np.abs(audio) > threshold)[0]
     if len(nonzero) == 0:
         return audio
-    return audio[nonzero[0]:nonzero[-1] + 1]
+    
+    start = nonzero[0]
+    end = nonzero[-1]
+    
+    # Get the trimmed audio
+    audio_trimmed = audio[start:end + 1]
+    
+    # Apply very short fade in/out to avoid pops (5-10ms is typical)
+    fade_samples = int(0.005 * fs)  # 5ms fade
+    fade_samples = min(fade_samples, len(audio_trimmed) // 4)  # Don't fade more than 25% of audio
+    
+    if fade_samples > 0:
+        # Fade in
+        fade_in = np.linspace(0, 1, fade_samples)
+        audio_trimmed[:fade_samples] *= fade_in
+        
+        # Fade out
+        fade_out = np.linspace(1, 0, fade_samples)
+        audio_trimmed[-fade_samples:] *= fade_out
+    
+    return audio_trimmed
 
 
 def add_variation(
@@ -247,7 +268,7 @@ def generate_single_note_variations(
             articulation = "downstroke"
     
     # Trim silence
-    audio = trim_silence(audio)
+    audio = trim_silence(audio, fs=fs)
     
     # Detect or use override note
     if note_override:
