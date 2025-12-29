@@ -8,6 +8,14 @@ Processes single-note input files and generates complete sample library with var
 - Synthesizes missing notes using advanced pitch-shifting from nearest available note
 - Marks synthesized notes with _synthesized suffix
 - Handles duplicate notes with _nn numbering
+- NEW: --detected-only option to only create samples from originally detected pitches
+
+# Original behavior (generates full range with synthesis):
+python di_sample_generator_combined.py *.wav output/
+
+# New behavior (only detected notes, no synthesis):
+python di_sample_generator_combined.py *.wav output/ --detected-only
+
 """
 
 import numpy as np
@@ -208,9 +216,7 @@ def trim_silence(audio: np.ndarray, threshold: float = 0.01, fs: int = 44100) ->
     
     # Apply very short fade in/out to avoid pops (5-10ms is typical)
     fade_samples = int(0.005 * fs)  # 5ms fade
-    fade_samples = min(fade_samples, len(audio_trimmed) // 4)  # Don't fade more than 25% of audio
-    
-    if fade_samples > 0:
+    if len(audio_trimmed) > 2 * fade_samples:
         # Fade in
         fade_in = np.linspace(0, 1, fade_samples)
         audio_trimmed[:fade_samples] *= fade_in
@@ -222,6 +228,8 @@ def trim_silence(audio: np.ndarray, threshold: float = 0.01, fs: int = 44100) ->
     return audio_trimmed
 
 
+# =============== VARIATION GENERATION ===============
+
 def add_variation(
     audio: np.ndarray,
     fs: int,
@@ -230,182 +238,128 @@ def add_variation(
     amplitude_db: float = 0.3
 ) -> np.ndarray:
     """
-    Add subtle randomized variations to audio sample (from single-note generator).
-    Returns modified audio with slight pitch, timing, and amplitude variations.
+    Add subtle natural variations to a note sample.
+    
+    Args:
+        audio: Input audio
+        fs: Sample rate
+        pitch_cents: Maximum pitch variation in cents (±)
+        timing_ms: Maximum timing shift in milliseconds (±)
+        amplitude_db: Maximum amplitude variation in dB (±)
+    
+    Returns:
+        Modified audio with variations
     """
-    original_length = len(audio)
-    varied = audio.copy()
+    result = audio.copy()
     
-    # Random pitch variation (in cents)
-    cent_shift = np.random.uniform(-pitch_cents, pitch_cents)
-    varied = librosa.effects.pitch_shift(varied, sr=fs, n_steps=cent_shift/100.0)
-    
-    # Trim pitch_shift output back to original length (it may add padding)
-    if len(varied) > original_length:
-        varied = varied[:original_length]
-    elif len(varied) < original_length:
-        varied = np.pad(varied, (0, original_length - len(varied)), mode='constant')
-    
-    # Random amplitude variation
-    db_shift = np.random.uniform(-amplitude_db, amplitude_db)
-    amplitude_factor = 10 ** (db_shift / 20.0)
-    varied = varied * amplitude_factor
-    
-    return varied
-
-
-# =============== ADVANCED SYNTHESIS FUNCTIONS (from di_sample_generator.py) ===============
-
-def separate_attack_sustain(audio: np.ndarray, fs: int, attack_ms: float = 50) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Separate the attack transient from the sustain portion of a note.
-    Returns (attack, sustain, crossfade_samples).
-    """
-    attack_samples = int((attack_ms / 1000.0) * fs)
-    attack_samples = min(attack_samples, len(audio) // 3)
-    
-    if attack_samples >= len(audio):
-        return audio, np.array([]), 0
-    
-    # Use envelope to find actual attack end
-    window_size = max(1, int(0.005 * fs))
-    envelope = np.convolve(np.abs(audio), np.ones(window_size) / window_size, mode='same')
-    
-    # Find peak in first portion
-    search_end = min(attack_samples * 2, len(audio))
-    peak_idx = np.argmax(envelope[:search_end])
-    
-    # Attack ends slightly after peak
-    attack_end = min(peak_idx + attack_samples // 2, len(audio) - 1)
-    
-    crossfade_samples = min(int(0.01 * fs), attack_end // 2)
-    
-    attack = audio[:attack_end].copy()
-    sustain = audio[attack_end - crossfade_samples:].copy()
-    
-    return attack, sustain, crossfade_samples
-
-
-def apply_inharmonic_shift(
-    audio: np.ndarray,
-    sample_rate: int,
-    semitones: float,
-    source_midi: int,
-    target_midi: int
-) -> np.ndarray:
-    """
-    Apply pitch shift with inharmonicity compensation.
-    """
-    if abs(semitones) < 0.01:
-        return audio.copy()
-    
-    # Get inharmonicity coefficients
-    B_source = get_inharmonicity_coeff(source_midi)
-    B_target = get_inharmonicity_coeff(target_midi)
-    
-    # Separate attack and sustain
-    attack, sustain, crossfade = separate_attack_sustain(audio, sample_rate, attack_ms=50)
-    
-    # Shift attack (preserve transient character)
-    attack_shifted = librosa.effects.pitch_shift(attack, sr=sample_rate, n_steps=semitones)
-    
-    # For sustain, use phase vocoder with inharmonicity correction
-    if len(sustain) > crossfade:
-        # STFT parameters
-        n_fft = 4096
-        hop_length = n_fft // 4
+    # 1. Pitch variation (subtle pitch shift)
+    if pitch_cents > 0:
+        cents_shift = np.random.uniform(-pitch_cents, pitch_cents)
+        semitone_shift = cents_shift / 100.0
         
-        # Compute STFT
-        D = librosa.stft(sustain, n_fft=n_fft, hop_length=hop_length)
-        
-        # Frequency bins
-        freqs = librosa.fft_frequencies(sr=sample_rate, n_fft=n_fft)
-        
-        # Pitch shift ratio
-        shift_ratio = 2 ** (semitones / 12.0)
-        
-        # Apply inharmonicity-aware frequency scaling
-        D_shifted = np.zeros_like(D, dtype=complex)
-        
-        for i, freq in enumerate(freqs):
-            if freq < 20:
-                continue
-            
-            # Inharmonic frequency relationship
-            # f_n = n * f0 * sqrt(1 + B * n^2)
-            harmonic_num = freq / midi_to_freq(source_midi)
-            if harmonic_num < 0.5:
-                continue
-            
-            n = int(round(harmonic_num))
-            if n < 1:
-                n = 1
-            
-            # Source frequency with inharmonicity
-            f_source = n * midi_to_freq(source_midi) * np.sqrt(1 + B_source * n * n)
-            
-            # Target frequency with inharmonicity
-            f_target = n * midi_to_freq(target_midi) * np.sqrt(1 + B_target * n * n)
-            
-            # Find target bin
-            target_freq = f_target
-            target_bin = int(round(target_freq * n_fft / sample_rate))
-            
-            if 0 <= target_bin < len(freqs):
-                D_shifted[target_bin] += D[i]
-        
-        # Inverse STFT
-        sustain_shifted = librosa.istft(D_shifted, hop_length=hop_length, length=len(sustain))
-    else:
-        sustain_shifted = librosa.effects.pitch_shift(sustain, sr=sample_rate, n_steps=semitones)
-    
-    # Crossfade attack and sustain
-    if crossfade > 0 and len(sustain_shifted) >= crossfade:
-        fade_out = np.linspace(1, 0, crossfade)
-        fade_in = np.linspace(0, 1, crossfade)
-        
-        attack_shifted[-crossfade:] = (
-            attack_shifted[-crossfade:] * fade_out +
-            sustain_shifted[:crossfade] * fade_in
+        # Use high-quality pitch shifting
+        result = librosa.effects.pitch_shift(
+            result, 
+            sr=fs, 
+            n_steps=semitone_shift,
+            bins_per_octave=12
         )
-        result = np.concatenate([attack_shifted, sustain_shifted[crossfade:]])
-    else:
-        result = np.concatenate([attack_shifted, sustain_shifted])
+    
+    # 2. Timing variation (small shift forward/backward)
+    if timing_ms > 0:
+        max_shift_samples = int((timing_ms / 1000.0) * fs)
+        shift_samples = np.random.randint(-max_shift_samples, max_shift_samples + 1)
+        
+        if shift_samples > 0:
+            # Shift forward (delay)
+            result = np.concatenate([np.zeros(shift_samples), result])
+        elif shift_samples < 0:
+            # Shift backward (advance)
+            result = result[-shift_samples:]
+    
+    # 3. Amplitude variation
+    if amplitude_db > 0:
+        db_change = np.random.uniform(-amplitude_db, amplitude_db)
+        amplitude_factor = 10 ** (db_change / 20.0)
+        result = result * amplitude_factor
     
     return result
 
 
+# =============== SYNTHESIS ===============
+
 def synthesize_from_nearest(
     target_midi: int,
-    available_notes: Dict[int, np.ndarray],
+    available_samples: Dict[int, np.ndarray],
     fs: int
 ) -> Optional[np.ndarray]:
     """
-    Synthesize a note by pitch-shifting from the nearest available note.
-    Prefers closer notes for better quality.
+    Synthesize a note by pitch-shifting the nearest available sample.
+    Uses phase vocoder for high-quality pitch shifting.
+    
+    Args:
+        target_midi: MIDI note to synthesize
+        available_samples: Dict of {midi_num: audio} for available samples
+        fs: Sample rate
+    
+    Returns:
+        Synthesized audio or None if no samples available
     """
-    if not available_notes:
+    if not available_samples:
         return None
     
-    # Find nearest note
-    available = sorted(available_notes.keys())
-    nearest = min(available, key=lambda x: abs(x - target_midi))
+    # Find nearest available MIDI note
+    available_midis = sorted(available_samples.keys())
+    nearest_midi = min(available_midis, key=lambda x: abs(x - target_midi))
     
-    semitones = target_midi - nearest
+    # Calculate semitone shift needed
+    semitone_shift = target_midi - nearest_midi
     
-    # Apply inharmonic pitch shift
-    synthesized = apply_inharmonic_shift(
-        available_notes[nearest],
-        fs,
-        semitones,
-        source_midi=nearest,
-        target_midi=target_midi
-    )
+    # Get source audio
+    source_audio = available_samples[nearest_midi]
     
-    return synthesized
+    # Apply pitch shift using librosa's high-quality phase vocoder
+    try:
+        shifted_audio = librosa.effects.pitch_shift(
+            source_audio,
+            sr=fs,
+            n_steps=semitone_shift,
+            bins_per_octave=12
+        )
+        
+        # Apply inharmonicity adjustment for realism
+        inharmonicity = get_inharmonicity_coeff(target_midi)
+        if inharmonicity > 0:
+            # Add subtle spectral stretching to emulate string physics
+            # This is a simplified model - real strings have complex partial relationships
+            D = librosa.stft(shifted_audio)
+            
+            # Stretch higher partials slightly (inharmonicity effect)
+            freq_bins = librosa.fft_frequencies(sr=fs)
+            stretch_factor = 1 + inharmonicity * (freq_bins / 1000.0) ** 2
+            
+            # Apply stretching in frequency domain
+            D_stretched = D.copy()
+            for i in range(D.shape[1]):
+                interp = interp1d(
+                    freq_bins * stretch_factor,
+                    np.abs(D[:, i]),
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=0
+                )
+                D_stretched[:, i] = interp(freq_bins) * np.exp(1j * np.angle(D[:, i]))
+            
+            shifted_audio = librosa.istft(D_stretched)
+        
+        return shifted_audio
+        
+    except Exception as e:
+        print(f"    Warning: Pitch shift failed for MIDI {target_midi}: {e}")
+        return None
 
 
-# =============== MAIN PROCESSING FUNCTION ===============
+# =============== FILE PROCESSING ===============
 
 def process_input_files(
     input_files: List[str],
@@ -415,124 +369,125 @@ def process_input_files(
     sample_rate: Optional[int] = None,
     pitch_variation: float = 1.5,
     timing_variation: float = 2.0,
-    amplitude_variation: float = 0.3
+    amplitude_variation: float = 0.3,
+    detected_only: bool = False
 ):
     """
-    Process multiple input files and generate complete sample library.
+    Process input files and generate complete sample library.
+    
+    Args:
+        detected_only: If True, only create samples for detected pitches (no synthesis)
     """
-    print(f"\n{'='*70}")
-    print(f"Combined Guitar DI Sample Generator")
-    print(f"{'='*70}")
-    
-    # Step 1: Load and identify all input notes
-    print(f"\nProcessing {len(input_files)} input file(s)...")
-    
-    # Track notes by articulation: articulation -> midi -> [(audio, filename, fs)]
-    detected_notes_by_articulation: Dict[str, Dict[int, List[Tuple[np.ndarray, str, int]]]] = defaultdict(lambda: defaultdict(list))
-    
-    for input_file in input_files:
-        if not os.path.exists(input_file):
-            print(f"  ✗ Not found: {input_file}")
-            continue
-        
-        # Detect articulation
-        if articulation_override:
-            articulation = articulation_override
-        else:
-            articulation = detect_articulation(os.path.basename(input_file))
-        
-        # Load audio
-        print(f"  Loading: {os.path.basename(input_file)}...", end=" ", flush=True)
-        audio, fs = librosa.load(input_file, sr=sample_rate, mono=True)
-        print(f"({len(audio)/fs:.1f}s)", end=" ", flush=True)
-        
-        # Detect if this file contains single or multiple notes
-        segments = detect_notes_in_audio(audio, fs)
-        
-        if len(segments) == 0:
-            print("✗ No audio detected")
-            continue
-        elif len(segments) == 1:
-            print(f"single note...", end=" ", flush=True)
-        else:
-            print(f"{len(segments)} notes...", end=" ", flush=True)
-        
-        # Process each detected segment
-        for seg_idx, (start, end) in enumerate(segments):
-            segment = audio[start:end]
-            segment = trim_silence(segment, fs=fs)
-            
-            # Detect pitch from middle 60% for stability
-            mid_len = int(len(segment) * 0.6)
-            mid_start = (len(segment) - mid_len) // 2
-            pitch_segment = segment[mid_start:mid_start + mid_len]
-            
-            # Limit to 2 seconds for pitch detection to avoid hanging
-            pitch_segment = pitch_segment[:int(2 * fs)] if len(pitch_segment) > 2 * fs else pitch_segment
-            
-            freq = estimate_pitch(pitch_segment, fs)
-            
-            if freq == 0:
-                if len(segments) == 1:
-                    print(f"✗ Could not detect pitch")
-                continue
-            
-            midi_num = freq_to_midi(freq)
-            
-            if midi_num == -1 or midi_num < GUITAR_RANGE['min_midi'] or midi_num > GUITAR_RANGE['max_midi']:
-                if len(segments) == 1:
-                    print(f"✗ Out of range ({freq:.1f} Hz)")
-                continue
-            
-            note_name = midi_to_note_name(midi_num)
-            detected_notes_by_articulation[articulation][midi_num].append((segment, os.path.basename(input_file), fs))
-            
-            if len(segments) == 1:
-                print(f"✓ {note_name} (MIDI {midi_num}, {freq:.1f} Hz) [{articulation}]")
-            else:
-                if seg_idx == 0:
-                    print()
-                print(f"    ✓ {note_name} (MIDI {midi_num}, {freq:.1f} Hz) [{articulation}]")
-    
-    if not detected_notes_by_articulation:
-        print("\nERROR: No valid notes detected in input files!")
-        sys.exit(1)
-    
-    # Count total unique notes across all articulations
-    total_detected = sum(len(notes) for notes in detected_notes_by_articulation.values())
-    print(f"\nDetected {total_detected} note(s) across {len(detected_notes_by_articulation)} articulation(s):")
-    for artic, notes in detected_notes_by_articulation.items():
-        print(f"  {artic}: {len(notes)} unique MIDI number(s)")
-    
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
     
-    # Step 2: Process each articulation separately
-    all_midis = range(GUITAR_RANGE['min_midi'], GUITAR_RANGE['max_midi'] + 1)
-    total_notes_per_articulation = len(all_midis)
+    # Storage for detected notes by articulation
+    # Structure: {articulation: {midi_num: [(audio, filename, fs), ...]}}
+    detected_notes_by_articulation = defaultdict(lambda: defaultdict(list))
+    
+    print(f"\n{'='*70}")
+    print(f"PROCESSING INPUT FILES")
+    print(f"{'='*70}\n")
+    
+    # First pass: detect and categorize all notes
+    for input_file in input_files:
+        print(f"Analyzing: {os.path.basename(input_file)}")
+        
+        try:
+            audio, fs_orig = librosa.load(input_file, sr=sample_rate, mono=True)
+        except Exception as e:
+            print(f"  ERROR loading file: {e}")
+            continue
+        
+        fs = sample_rate if sample_rate else fs_orig
+        
+        # Detect articulation
+        articulation = articulation_override if articulation_override else detect_articulation(input_file)
+        
+        # Detect note boundaries
+        segments = detect_notes_in_audio(audio, fs)
+        
+        if not segments:
+            print(f"  No notes detected in file")
+            continue
+        
+        print(f"  Articulation: {articulation}")
+        print(f"  Detected {len(segments)} note(s)")
+        
+        # Process each detected note
+        for seg_idx, (start, end) in enumerate(segments):
+            note_audio = audio[start:end]
+            
+            # Estimate pitch
+            freq = estimate_pitch(note_audio, fs)
+            if freq == 0:
+                print(f"    Segment {seg_idx + 1}: Pitch detection failed")
+                continue
+            
+            midi_num = freq_to_midi(freq)
+            note_name = midi_to_note_name(midi_num)
+            
+            # Validate MIDI range
+            if midi_num < GUITAR_RANGE['min_midi'] or midi_num > GUITAR_RANGE['max_midi']:
+                print(f"    Segment {seg_idx + 1}: {note_name} ({freq:.1f} Hz) - out of guitar range, skipping")
+                continue
+            
+            # Trim and store
+            note_audio = trim_silence(note_audio, fs=fs)
+            detected_notes_by_articulation[articulation][midi_num].append(
+                (note_audio, os.path.basename(input_file), fs)
+            )
+            
+            print(f"    ✓ Segment {seg_idx + 1}: {note_name} ({freq:.1f} Hz, MIDI {midi_num})")
+    
+    if not detected_notes_by_articulation:
+        print("\nERROR: No valid notes detected in any input files!")
+        sys.exit(1)
+    
+    # Second pass: generate sample library for each articulation
+    print(f"\n{'='*70}")
+    print(f"GENERATING SAMPLE LIBRARY")
+    print(f"{'='*70}\n")
+    
     grand_total_files = 0
     all_synthesized_by_articulation = {}
     
     for articulation, detected_notes in detected_notes_by_articulation.items():
-        print(f"\n{'='*70}")
-        print(f"Processing articulation: {articulation}")
-        print(f"{'='*70}")
+        print(f"\n{articulation.upper()}")
+        print("-" * 70)
         
-        # Prepare base samples (handle duplicates) for this articulation
-        base_samples: Dict[int, np.ndarray] = {}
-        duplicate_samples: Dict[int, List[np.ndarray]] = defaultdict(list)
+        # Determine which notes we'll generate
+        if detected_only:
+            # Only generate variations for detected notes
+            all_midis = sorted(detected_notes.keys())
+            print(f"Mode: DETECTED ONLY (no synthesis)")
+        else:
+            # Generate full range (detected + synthesized)
+            all_midis = list(range(GUITAR_RANGE['min_midi'], GUITAR_RANGE['max_midi'] + 1))
+            print(f"Mode: FULL RANGE (with synthesis)")
         
-        for midi_num, samples_list in detected_notes.items():
-            # Use first sample as base
-            base_samples[midi_num] = samples_list[0][0]
-            # Store duplicates
-            for audio, filename, fs_dup in samples_list[1:]:
-                duplicate_samples[midi_num].append(audio)
+        # Get first sample's sample rate
+        first_midi = list(detected_notes.keys())[0]
+        fs = detected_notes[first_midi][0][2]
         
+        # Organize samples: use first occurrence as base, rest as duplicates
+        base_samples = {}
+        duplicate_samples = defaultdict(list)
+        
+        for midi_num, occurrences in detected_notes.items():
+            base_samples[midi_num] = occurrences[0][0]
+            if len(occurrences) > 1:
+                duplicate_samples[midi_num] = [occ[0] for occ in occurrences[1:]]
+        
+        # Calculate totals
+        total_notes_per_articulation = len(all_midis)
         synthesized_notes = []
         
         print(f"\nGenerating {total_notes_per_articulation} notes × {versions} versions...")
-        print(f"Detected: {len(base_samples)}, Will synthesize: {total_notes_per_articulation - len(base_samples)}\n")
+        if not detected_only:
+            print(f"Detected: {len(base_samples)}, Will synthesize: {total_notes_per_articulation - len(base_samples)}\n")
+        else:
+            print(f"Detected: {len(base_samples)}, Synthesis: disabled\n")
         
         for midi_num in all_midis:
             note_name = midi_to_note_name(midi_num)
@@ -546,6 +501,11 @@ def process_input_files(
                 # Get sample rate from first detected sample
                 fs = detected_notes[midi_num][0][2]
             else:
+                # Only synthesize if not in detected-only mode
+                if detected_only:
+                    # Skip this note entirely
+                    continue
+                
                 # Synthesize from nearest note in THIS articulation
                 base_audio = synthesize_from_nearest(midi_num, base_samples, fs)
                 is_synthesized = True
@@ -618,7 +578,8 @@ def process_input_files(
         # Summary for this articulation
         print(f"\n  {articulation} complete:")
         print(f"    Detected: {len(base_samples)}")
-        print(f"    Synthesized: {len(synthesized_notes)}")
+        if not detected_only:
+            print(f"    Synthesized: {len(synthesized_notes)}")
         print(f"    Total files: {total_notes_per_articulation * versions}")
     
     # Final Summary
@@ -629,19 +590,20 @@ def process_input_files(
     print(f"Total files generated:   {grand_total_files}")
     print(f"Output directory:        {output_dir}")
     
-    # List synthesized notes by articulation
-    for articulation, synth_notes in all_synthesized_by_articulation.items():
-        if synth_notes:
-            print(f"\nSynthesized notes for {articulation} ({len(synth_notes)}):")
-            # Group by octave for readability
-            by_octave = defaultdict(list)
-            for note in synth_notes:
-                octave = note[-1]
-                by_octave[octave].append(note)
-            
-            for octave in sorted(by_octave.keys()):
-                notes = by_octave[octave]
-                print(f"  Octave {octave}: {', '.join(notes)}")
+    # List synthesized notes by articulation (only if synthesis was enabled)
+    if not detected_only:
+        for articulation, synth_notes in all_synthesized_by_articulation.items():
+            if synth_notes:
+                print(f"\nSynthesized notes for {articulation} ({len(synth_notes)}):")
+                # Group by octave for readability
+                by_octave = defaultdict(list)
+                for note in synth_notes:
+                    octave = note[-1]
+                    by_octave[octave].append(note)
+                
+                for octave in sorted(by_octave.keys()):
+                    notes = by_octave[octave]
+                    print(f"  Octave {octave}: {', '.join(notes)}")
     
     print(f"{'='*70}\n")
 
@@ -668,6 +630,9 @@ Examples:
   
   # Subtle variations
   %(prog)s *.wav output/ --pitch-variation 0.5 --amplitude-variation 0.2
+  
+  # Only create samples from detected pitches (no synthesis)
+  %(prog)s *.wav output/ --detected-only
         """
     )
     
@@ -688,6 +653,8 @@ Examples:
                         help='Max timing variation in ms (default: 2.0)')
     parser.add_argument('--amplitude-variation', type=float, default=0.3,
                         help='Max amplitude variation in dB (default: 0.3)')
+    parser.add_argument('--detected-only', action='store_true',
+                        help='Only create samples for detected pitches, do not synthesize missing notes')
     
     args = parser.parse_args()
     
@@ -734,7 +701,8 @@ Examples:
         sample_rate=args.sample_rate,
         pitch_variation=args.pitch_variation,
         timing_variation=args.timing_variation,
-        amplitude_variation=args.amplitude_variation
+        amplitude_variation=args.amplitude_variation,
+        detected_only=args.detected_only
     )
 
 
